@@ -57,7 +57,25 @@ class TextEncoderAPI:
                 filename=filename,
                 api_name="/DemoWrapper",
             )
-            path = result[0]["value"]
+            # Normalize across Gradio versions:
+            #   Gradio ≤3.x  → result is tuple; result[0] is dict with "value" key
+            #   Gradio 4.x+  → result is tuple; result[0] is str (downloaded path)
+            #   Single-output (reduce_singleton_output) → result is the unwrapped value
+            #   Our local server (gr.JSON, {"value": path}) → result is the dict
+            if isinstance(result, str):
+                path = result
+            elif isinstance(result, dict):
+                path = result.get("value") or result.get("path") or result.get("name")
+            elif isinstance(result, (list, tuple)):
+                item = result[0]
+                if isinstance(item, str):
+                    path = item
+                elif isinstance(item, dict):
+                    path = item.get("value") or item.get("path") or item.get("name")
+                else:
+                    path = str(item)
+            else:
+                path = str(result)
             tensor = np.load(path)
             length = tensor.shape[0]
 

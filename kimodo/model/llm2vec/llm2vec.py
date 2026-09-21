@@ -353,7 +353,10 @@ class LLM2Vec(nn.Module):
 
         if torch.cuda.device_count() <= 1:
             # This branch also support mps devices
-            self.to(device)
+            # Skip .to() for dispatch-mapped models — dispatch_model sets hf_device_map
+            # and calling .to() on a multi-device dispatched model raises an error.
+            if not hasattr(self.model, "hf_device_map"):
+                self.to(device)
             for start_index in trange(
                 0,
                 len(sentences),
@@ -438,7 +441,8 @@ class LLM2Vec(nn.Module):
             if device is None and torch.cuda.is_available():
                 device = f"cuda:{rank % torch.cuda.device_count()}"
 
-        self.to(device)
+        if not hasattr(self.model, "hf_device_map"):
+            self.to(device)
         features = self.tokenize([self.prepare_for_tokenization(sentence) for sentence in sentences_batch])
         features = batch_to_device(features, device)
 

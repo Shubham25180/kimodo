@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """LLM2Vec encoder wrapper for Kimodo text conditioning."""
 
+import json
 import os
 
 import numpy as np
@@ -24,27 +25,76 @@ class LLM2VecEncoder:
         torch_dtype = getattr(torch, dtype)
         self.llm_dim = llm_dim
 
+        from transformers import AutoConfig, AutoTokenizer
+        from peft import PeftModel
+        from huggingface_hub import snapshot_download
+
         cache_dir = os.environ.get("HUGGINGFACE_CACHE_DIR")
+        dl_kwargs = {}
+        if cache_dir:
+            dl_kwargs["cache_dir"] = cache_dir
 
         if "TEXT_ENCODERS_DIR" in os.environ:
-            base_model_name_or_path = os.path.join(os.environ["TEXT_ENCODERS_DIR"], base_model_name_or_path)
-            peft_model_name_or_path = os.path.join(os.environ["TEXT_ENCODERS_DIR"], peft_model_name_or_path)
+            mntp_local = os.path.join(os.environ["TEXT_ENCODERS_DIR"], base_model_name_or_path)
+            supervised_local = os.path.join(os.environ["TEXT_ENCODERS_DIR"], peft_model_name_or_path)
+        else:
+            mntp_local = snapshot_download(base_model_name_or_path, **dl_kwargs)
+            supervised_local = snapshot_download(peft_model_name_or_path, **dl_kwargs)
 
-        self.model = LLM2Vec.from_pretrained(
-            base_model_name_or_path=base_model_name_or_path,
-            peft_model_name_or_path=peft_model_name_or_path,
-            torch_dtype=torch_dtype,
-            cache_dir=cache_dir,
+        # Find the true LLaMA base from the MNTP adapter config
+        with open(os.path.join(mntp_local, "adapter_config.json")) as f:
+            adapter_cfg = json.load(f)
+        llama_model_id = adapter_cfg["base_model_name_or_path"]  # meta-llama/Meta-Llama-3-8B-Instruct
+        llama_local = snapshot_download(llama_model_id, **dl_kwargs)
+
+        # Get the bidirectional LLaMA model class
+        llama_config = AutoConfig.from_pretrained(llama_local)
+        model_class = LLM2Vec._get_model_class(
+            llama_config.__class__.__name__, enable_bidirectional=True
         )
 
-        env_device = os.environ.get("TEXT_ENCODER_DEVICE")
-        if env_device:
-            device = env_device
-        if device == "auto":
-            device = "cuda" if torch.cuda.is_available() else "cpu"
-        self._device = device
-        if device is not None:
-            self.model = self.model.to(device)
+        # Step 1: Load the bare LLaMA base to CPU in bfloat16.
+        # bitsandbytes NF4/FP4/INT8 CUDA kernels crash (0xC0000005) on SM 12.0 (RTX 5080, Blackwell).
+        # device_map=anything also crashes (accelerate queries CUDA even for CPU target on SM 12.0).
+        # No device_map + low_cpu_mem_usage=True → pure PyTorch CPU load, no accelerate, no CUDA init.
+        # Text encoding runs once per generation; CPU speed is acceptable.
+        base_model = model_class.from_pretrained(
+            llama_local,
+            torch_dtype=torch_dtype,
+            low_cpu_mem_usage=True,
+        )
+
+        # Step 2: Apply MNTP LoRA adapter via PeftModel (not model.load_adapter)
+        model = PeftModel.from_pretrained(base_model, mntp_local)
+
+        # Step 3: Apply supervised LoRA adapter on top
+        model = PeftModel.from_pretrained(model, supervised_local)
+
+        # Load tokenizer from MNTP (has correct padding config for LLM2Vec)
+        tokenizer = AutoTokenizer.from_pretrained(mntp_local)
+        tokenizer.pad_token = tokenizer.eos_token
+        tokenizer.padding_side = "left"
+
+        # Read llm2vec_config.json if present
+        llm2vec_config: dict = {}
+        for cfg_dir in (supervised_local, mntp_local):
+            cfg_path = os.path.join(cfg_dir, "llm2vec_config.json")
+            if os.path.exists(cfg_path):
+                with open(cfg_path) as f:
+                    llm2vec_config = json.load(f)
+                break
+
+        self.model = LLM2Vec(
+            model=model,
+            tokenizer=tokenizer,
+            pooling_mode=llm2vec_config.get("pooling_mode", "mean"),
+            max_length=llm2vec_config.get("max_length", 512),
+            doc_max_length=llm2vec_config.get("doc_max_length", 400),
+            skip_instruction=llm2vec_config.get("skip_instruction", True),
+        )
+
+        # Model lives on CPU; device_map="cuda:*" crashes on SM 12.0 (Blackwell bitsandbytes issue)
+        self._device = "cpu"
 
         self.model.eval()
         for p in self.model.parameters():
@@ -71,11 +121,6 @@ class LLM2VecEncoder:
         with torch.no_grad():
             encoded_text = self.model.encode(
                 text,
-                # IMPORTANT: different batch sizes unexpectedly change the output embeddings, so we always set it to 1
-                #            here for repeatability no matter how many texts are being encoded. This
-                #            is a fundamental issue with transformers, and is especially bad at lower
-                #            precisions (https://github.com/huggingface/transformers/issues/25420#issuecomment-1775317535)
-                #            note: this is an internal batch size used by llm2vec - the text list can still be of arbitrary length.
                 batch_size=1,
                 show_progress_bar=False,
                 device=self._device,
